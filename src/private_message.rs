@@ -7,31 +7,23 @@ use tracing::{debug, error, info};
 
 use crate::error::IrcMatchError;
 
-#[derive(Debug)]
-pub struct Channel {
-    receiver: broadcast::Receiver<(String, String)>,
-    sender: mpsc::Sender<Command>,
-    name: String,
-}
-
 async fn background_task(
-    channel: String,
+    name: String,
     mut receiver: broadcast::Receiver<Message>,
     sender: mpsc::Sender<Command>,
-    ch_receiver_tx: broadcast::Sender<(String, String)>,
+    ch_receiver_tx: broadcast::Sender<String>,
     mut ch_sender_rx: mpsc::Receiver<Command>,
 ) {
-    info!("Listening {channel}");
+    info!("Listening PM {name}");
     loop {
         let res = async {
             tokio::select! {
                 msg = receiver.recv() => {
                     let msg = msg?;
-                    let nickname = msg.source_nickname().map(str::to_string);
-                    match (msg.command, nickname) {
-                        (Command::PRIVMSG(ch, context), Some(nickname)) if ch.as_str() == &channel => {
-                            debug!("[{channel}] {nickname}: {context}");
-                            ch_receiver_tx.send((nickname, context))?;
+                    match msg.command {
+                        Command::PRIVMSG(_, context) if msg.source_nickname() == Some(&name) => {
+                            debug!("[PM] {name}: {context}");
+                            ch_receiver_tx.send(context)?;
                         }
                         _ => (),
                     }
@@ -48,25 +40,25 @@ async fn background_task(
 
         match res {
             Ok(false) => break,
-            Err(e) => error!("Error caught on handling channel {channel}: {e:?}"),
+            Err(e) => error!("Error caught on handling private message {name}: {e:?}"),
             _ => continue,
         }
     }
 
-    info!("Leaving {channel}");
+    info!("Leaving {name}");
     sender
-        .send(Command::PART(channel.to_string(), None))
+        .send(Command::PART(name.to_string(), None))
         .await
         .expect("¿");
 
-    debug!("Drop {channel} monitoring");
+    debug!("Drop {name} monitoring");
 }
 
 async fn handle_channel_msg_stream(
     channel: String,
     sender: mpsc::Sender<Command>,
     receiver: broadcast::Receiver<Message>,
-) -> Result<(broadcast::Receiver<(String, String)>, mpsc::Sender<Command>), IrcMatchError> {
+) -> Result<(broadcast::Receiver<String>, mpsc::Sender<Command>), IrcMatchError> {
     let (ch_receiver_tx, ch_receiver_rx) = broadcast::channel(128);
     let (ch_sender_tx, ch_sender_rx) = mpsc::channel(8);
 
@@ -81,15 +73,21 @@ async fn handle_channel_msg_stream(
     Ok((ch_receiver_rx, ch_sender_tx))
 }
 
-impl Channel {
+pub struct PrivateMessage {
+    name: String,
+    receiver: broadcast::Receiver<String>,
+    sender: mpsc::Sender<Command>,
+}
+
+impl PrivateMessage {
     pub async fn new(
         channel: &str,
         sender: mpsc::Sender<Command>,
         receiver: broadcast::Receiver<Message>,
-    ) -> Result<Arc<Channel>, IrcMatchError> {
+    ) -> Result<Arc<PrivateMessage>, IrcMatchError> {
         let (receiver, sender) =
             handle_channel_msg_stream(channel.to_string(), sender, receiver).await?;
-        Ok(Arc::new(Channel {
+        Ok(Arc::new(PrivateMessage {
             name: channel.to_string(),
             receiver,
             sender,
@@ -99,13 +97,14 @@ impl Channel {
         self.name.as_str()
     }
     pub async fn send_message(&self, context: String) -> Result<(), IrcMatchError> {
+        debug!("PM -> {}: {context}", self.name);
         self.sender
             .send(Command::PRIVMSG(self.name.to_string(), context))
             .map_err(Into::into)
             .await
     }
 
-    pub fn receiver(&self) -> broadcast::Receiver<(String, String)> {
+    pub fn receiver(&self) -> broadcast::Receiver<String> {
         self.receiver.resubscribe()
     }
 }

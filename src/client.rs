@@ -1,16 +1,18 @@
+use std::sync::Arc;
+
 use futures::{StreamExt, TryFutureExt, TryStreamExt};
 use irc::{
     client::{data::Config, Client, ClientStream, Sender},
     proto::{Command, Message, Response},
 };
 use tokio::sync::{broadcast, mpsc};
-use tracing::{error, trace};
+use tracing::{debug, error, info};
 
-use crate::error::IrcMatchError;
+use crate::{channel::Channel, error::IrcMatchError, private_message::PrivateMessage};
 
 #[derive(Debug)]
 pub struct OsuIrcClient {
-    channel: Vec<String>,
+    channel: Vec<Arc<Channel>>,
     sender: mpsc::Sender<Command>,
     receiver: broadcast::Receiver<Message>,
 }
@@ -29,8 +31,8 @@ async fn background_task(
                     Ok::<bool, anyhow::Error>(true)
                 },
                 Some(com) = stream.next() => {
-                    trace!("RAW RECEIVE MESSAGE{com:?}");
-                    receiver_tx.send(com?)?;
+                    let com = com?;
+                    receiver_tx.send(com)?;
                     Ok::<bool, anyhow::Error>(true)
                 },
                 else => {
@@ -46,13 +48,14 @@ async fn background_task(
             _ => continue,
         }
     }
+    debug!("Dropping osu! Bancho IRC monitoring");
 }
 
 async fn handle_irc_msg_stream(
     mut cli: Client,
 ) -> Result<(mpsc::Sender<Command>, broadcast::Receiver<Message>), IrcMatchError> {
-    let (receiver_tx, receiver_rx) = broadcast::channel::<Message>(16);
-    let (sender_tx, sender_rx) = mpsc::channel::<Command>(16);
+    let (receiver_tx, receiver_rx) = broadcast::channel::<Message>(128);
+    let (sender_tx, sender_rx) = mpsc::channel::<Command>(128);
     let mut stream = cli.stream()?;
     let sender = cli.sender();
 
@@ -94,15 +97,16 @@ impl OsuIrcClient {
         .await?;
         cli.identify()?;
         let (sender_tx, receiver_rx) = handle_irc_msg_stream(cli).await?;
+        info!("Login to osu! irc success!");
         Ok(OsuIrcClient {
             channel: vec![],
             sender: sender_tx,
             receiver: receiver_rx,
         })
     }
-    pub async fn join_channel(&mut self, channel: String) -> Result<(), IrcMatchError> {
-        if self.channel.contains(&channel) {
-            return Ok(());
+    pub async fn join_channel(&mut self, channel: String) -> Result<Arc<Channel>, IrcMatchError> {
+        if let Some(ch) = self.channel.iter().find(|c| c.name() == &channel) {
+            return Ok(ch.clone());
         }
         self.sender
             .send(Command::JOIN(channel.clone(), None, Some("cho".into())))
@@ -122,7 +126,18 @@ impl OsuIrcClient {
             }
         }
 
-        self.channel.push(channel.to_string());
-        Ok(())
+        let channel =
+            Channel::new(&channel, self.sender.clone(), self.receiver.resubscribe()).await?;
+
+        self.channel.push(channel.clone());
+
+        Ok(channel)
+    }
+
+    pub async fn new_private_message(
+        &self,
+        name: String,
+    ) -> Result<Arc<PrivateMessage>, IrcMatchError> {
+        PrivateMessage::new(&name, self.sender.clone(), self.receiver.resubscribe()).await
     }
 }
