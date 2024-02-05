@@ -2,7 +2,7 @@ use irc::proto::Command;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
-pub enum IrcMatchError {
+pub enum BanchoIrcError {
     #[error(transparent)]
     SendMsgError(#[from] tokio::sync::mpsc::error::SendError<Command>),
     #[error(transparent)]

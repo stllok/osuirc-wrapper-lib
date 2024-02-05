@@ -8,7 +8,10 @@ use irc::{
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info};
 
-use crate::{channel::Channel, error::IrcMatchError, private_message::PrivateMessage};
+use crate::{
+    channel::{Channel, ChannelType},
+    error::BanchoIrcError,
+};
 
 #[derive(Debug)]
 pub struct OsuIrcClient {
@@ -27,6 +30,7 @@ async fn background_task(
         let res = async {
             tokio::select! {
                 Some(com) = sender_rx.recv() => {
+                    debug!("Receive command: {com:?}");
                     sender.send(com)?;
                     Ok::<bool, anyhow::Error>(true)
                 },
@@ -53,7 +57,7 @@ async fn background_task(
 
 async fn handle_irc_msg_stream(
     mut cli: Client,
-) -> Result<(mpsc::Sender<Command>, broadcast::Receiver<Message>), IrcMatchError> {
+) -> Result<(mpsc::Sender<Command>, broadcast::Receiver<Message>), BanchoIrcError> {
     let (receiver_tx, receiver_rx) = broadcast::channel::<Message>(128);
     let (sender_tx, sender_rx) = mpsc::channel::<Command>(128);
     let mut stream = cli.stream()?;
@@ -63,12 +67,15 @@ async fn handle_irc_msg_stream(
     while let Some(com) = stream.try_next().await? {
         match com.command {
             Command::Response(Response::ERR_PASSWDMISMATCH, f) => {
-                return Err(IrcMatchError::IrcLoginFailure(f.join(" ")))
+                return Err(BanchoIrcError::IrcLoginFailure(f.join(" ")))
             }
             Command::Response(e, f) if e.is_error() => {
                 panic!("{}", f.join(" "))
             }
-            Command::Response(Response::RPL_WELCOME, _) => break,
+            Command::Response(Response::RPL_MOTD, f) => {
+                info!("{}", f.join(" "))
+            }
+            Command::Response(Response::RPL_ENDOFMOTD, _) => break,
             _ => continue,
         }
     }
@@ -79,7 +86,7 @@ async fn handle_irc_msg_stream(
 }
 
 impl OsuIrcClient {
-    pub async fn new(username: String, password: String) -> Result<OsuIrcClient, IrcMatchError> {
+    pub async fn new(username: String, password: String) -> Result<OsuIrcClient, BanchoIrcError> {
         let cli = Client::from_config(Config {
             nickname: Some(username.clone()),
             username: Some(username),
@@ -104,20 +111,20 @@ impl OsuIrcClient {
             receiver: receiver_rx,
         })
     }
-    pub async fn join_channel(&mut self, channel: String) -> Result<Arc<Channel>, IrcMatchError> {
+    pub async fn join_channel(&mut self, channel: String) -> Result<Arc<Channel>, BanchoIrcError> {
         if let Some(ch) = self.channel.iter().find(|c| c.name() == &channel) {
             return Ok(ch.clone());
         }
         self.sender
             .send(Command::JOIN(channel.clone(), None, Some("cho".into())))
-            .map_err(IrcMatchError::SendMsgError)
+            .map_err(BanchoIrcError::SendMsgError)
             .await?;
 
         loop {
             match self.receiver.recv().await?.command {
                 Command::JOIN(ch, _, _) if &ch == &channel => break,
                 Command::Response(Response::ERR_NOSUCHCHANNEL, f) => {
-                    return Err(IrcMatchError::ChannelDoesNotExists(f.join(" ")))
+                    return Err(BanchoIrcError::ChannelDoesNotExists(f.join(" ")))
                 }
                 Command::Response(e, f) if e.is_error() => {
                     panic!("{}", f.join(" "))
@@ -126,18 +133,24 @@ impl OsuIrcClient {
             }
         }
 
-        let channel =
-            Channel::new(&channel, self.sender.clone(), self.receiver.resubscribe()).await?;
+        let channel = Channel::new(
+            ChannelType::Public(channel),
+            self.sender.clone(),
+            self.receiver.resubscribe(),
+        )
+        .await?;
 
         self.channel.push(channel.clone());
 
         Ok(channel)
     }
 
-    pub async fn new_private_message(
-        &self,
-        name: String,
-    ) -> Result<Arc<PrivateMessage>, IrcMatchError> {
-        PrivateMessage::new(&name, self.sender.clone(), self.receiver.resubscribe()).await
+    pub async fn new_private_message(&self, name: String) -> Result<Arc<Channel>, BanchoIrcError> {
+        Channel::new(
+            ChannelType::Private(name),
+            self.sender.clone(),
+            self.receiver.resubscribe(),
+        )
+        .await
     }
 }
